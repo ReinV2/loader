@@ -1,0 +1,991 @@
+--[[
+-- reinhook v1 - loader
+    ===========================================================================
+   ]]
+
+local CONFIG = {
+    API = "https://reinauth.natxoxoheart.workers.dev",
+    KEY_CACHE = "reinhook/key.txt",
+    PAYLOAD_URL = "",
+    TITLE = "reinhook",
+    TAG = "v1",
+    HINT = "ready when you are",
+}
+
+local GENV = getgenv or function()
+    return _G
+end
+
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+-- muted monochrome, same palette as the menu
+local PANEL = Color3.fromRGB(19, 19, 21)
+local LINE = Color3.fromRGB(43, 43, 47)
+local TEXT = Color3.fromRGB(236, 236, 238)
+local MUTED = Color3.fromRGB(138, 138, 144)
+local SLATE = Color3.fromRGB(124, 139, 158)
+local DARK = Color3.fromRGB(13, 13, 15)
+local WHITE = Color3.fromRGB(226, 226, 230)
+local GOOD = Color3.fromRGB(127, 214, 168)
+local BAD = Color3.fromRGB(255, 110, 120)
+
+local STATUS = {
+    idle = MUTED,
+    work = SLATE,
+    good = GOOD,
+    bad = BAD,
+}
+
+local WIDTH = 384
+local HEIGHT = 212
+
+local StatusLabel, StatusDot, ProgressFill, Button, ButtonLabel, Caption
+
+local function tween(Object, Time, Props, Style)
+    TweenService:Create(Object, TweenInfo.new(Time, Style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out), Props):Play()
+end
+
+local function SetStatus(Kind, Text)
+    if not (StatusLabel and StatusLabel.Parent) then
+        return
+    end
+
+    StatusDot.BackgroundColor3 = STATUS[Kind] or STATUS.idle
+    StatusLabel.Text = Text
+    StatusLabel.TextColor3 = STATUS[Kind] or STATUS.idle
+end
+
+------------------------------------------------------------------ file glue
+
+local function readIfFile(Path)
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then
+        return nil
+    end
+
+    local Ok, Exists = pcall(isfile, Path)
+    if not Ok or not Exists then
+        return nil
+    end
+
+    local Ok2, Data = pcall(readfile, Path)
+    if Ok2 and type(Data) == "string" and #Data > 0 then
+        return Data
+    end
+
+    return nil
+end
+
+local function cachePayload(Source)
+    if type(writefile) ~= "function" then
+        return false
+    end
+
+    if type(makefolder) == "function" and type(isfolder) == "function" then
+        pcall(function()
+            if not isfolder(CONFIG.CACHE_DIR) then
+                makefolder(CONFIG.CACHE_DIR)
+            end
+        end)
+    end
+
+    pcall(writefile, CONFIG.CACHE_FILE, Source)
+
+    for _, Path in ipairs(CONFIG.LEGACY_FILES or {}) do
+        pcall(writefile, Path, Source)
+    end
+
+    return readIfFile(CONFIG.CACHE_FILE) ~= nil
+end
+
+------------------------------------------------------------------ key system
+
+local Session = nil
+
+-- Kept so the payload's heartbeat can refresh an expired token itself. Tokens
+-- live for one 10-minute bucket, so a session past that used to fail validation
+-- forever and the build shut itself down mid-raid.
+local ActiveKey = nil
+
+local function keyMode()
+    return type(CONFIG.API) == "string" and CONFIG.API ~= ""
+end
+
+-- The gate only means something over TLS, and a patched loader should not quietly
+-- point at another host: both are checked before any request goes out.
+local function apiTrusted()
+    if not keyMode() then
+        return true
+    end
+
+    return CONFIG.API:find("^https://", 1) ~= nil
+end
+
+local function hwid()
+    if type(gethwid) == "function" then
+        local Ok, Value = pcall(gethwid)
+
+        if Ok and type(Value) == "string" and #Value > 0 then
+            return Value
+        end
+    end
+
+    if type(get_hwid) == "function" then
+        local Ok, Value = pcall(get_hwid)
+
+        if Ok and type(Value) == "string" and #Value > 0 then
+            return Value
+        end
+    end
+
+    local Ok, Value = pcall(function()
+        return game:GetService("RbxAnalyticsService"):GetClientId()
+    end)
+
+    if Ok and type(Value) == "string" and #Value > 0 then
+        return Value
+    end
+
+    return "unknown"
+end
+
+local function storedKey()
+    local Text = readIfFile(CONFIG.KEY_CACHE)
+
+    if Text then
+        Text = Text:gsub("%s+", "")
+
+        if #Text >= 4 then
+            return Text
+        end
+    end
+
+    return nil
+end
+
+-- POST helper. game:HttpGet(url, nocache, headers, body) is a Synapse-era
+-- signature that many executors ignore, which silently turns the POST into a GET
+-- and the server answers with its root page. Prefer the modern request() APIs.
+local function post(Url, Body)
+    local G = GENV()
+    local Headers = { ["Content-Type"] = "application/json" }
+    local Candidates = { rawget(G, "request"), rawget(G, "http_request") }
+    local Syn = rawget(G, "syn")
+
+    if type(Syn) == "table" and type(Syn.request) == "function" then
+        table.insert(Candidates, Syn.request)
+    end
+
+    for _, Fn in ipairs(Candidates) do
+        if type(Fn) == "function" then
+            local Ok, Result = pcall(Fn, {
+                Url = Url,
+                Method = "POST",
+                Headers = Headers,
+                Body = Body,
+            })
+
+            if Ok and type(Result) == "table" and type(Result.Body) == "string" and #Result.Body > 0 then
+                return Result.Body
+            end
+        end
+    end
+
+    local Ok, Data = pcall(function()
+        return game:HttpGet(Url, true, Headers, Body)
+    end)
+
+    if Ok and type(Data) == "string" and #Data > 0 then
+        return Data
+    end
+
+    return nil
+end
+
+-- POST { key, hwid } and get a short-lived token back
+local function activate(Key)
+    local HttpService = game:GetService("HttpService")
+    local Player = game:GetService("Players").LocalPlayer
+    local Body = HttpService:JSONEncode({
+        key = Key,
+        hwid = hwid(),
+        user = Player and Player.Name or "unknown",
+        uid = Player and Player.UserId or 0,
+    })
+    local Response = post(CONFIG.API .. "/activate", Body)
+
+    if type(Response) ~= "string" or #Response == 0 then
+        return nil, "auth server unreachable"
+    end
+
+    local Decoded, Answer = pcall(function()
+        return HttpService:JSONDecode(Response)
+    end)
+
+    if not Decoded or type(Answer) ~= "table" then
+        return nil, "bad auth response: " .. Response:gsub("%s+", " "):sub(1, 32)
+    end
+
+    if Answer.ok ~= true or type(Answer.token) ~= "string" then
+        return nil, tostring(Answer.reason or "key rejected")
+    end
+
+    return Answer.token
+end
+
+-- Reported before the key is even typed, so injection attempts show up in Discord
+-- with the server and player, whether or not a valid key follows.
+local function preloadPing()
+    local HttpService = game:GetService("HttpService")
+    local Player = game:GetService("Players").LocalPlayer
+
+    post(CONFIG.API .. "/preload", HttpService:JSONEncode({
+        user = Player and Player.Name or "unknown",
+        uid = Player and Player.UserId or 0,
+        place = game.PlaceId,
+    }))
+end
+
+-- Five wrong keys and the session is over, with the kick text buyers were told
+-- about in the sales post.
+local Attempts = 0
+local KICK_AFTER = 5
+
+local function outOfAttempts()
+    Attempts += 1
+
+    if Attempts < KICK_AFTER then
+        return false
+    end
+
+    local Player = game:GetService("Players").LocalPlayer
+
+    if Player then
+        pcall(function()
+            Player:Kick("invalid key - if you're running into issues, please make a ticket")
+        end)
+    end
+
+    return true
+end
+
+-- the licensed payload, only ever delivered with a valid token
+local function fetchPayload()
+    if not Session then
+        return nil, "no session"
+    end
+
+    local Ok, Response = pcall(function()
+        return game:HttpGet(
+            CONFIG.API .. "/payload?token=" .. Session .. "&hwid=" .. hwid()
+        )
+    end)
+
+    if not Ok or type(Response) ~= "string" or #Response < 64 then
+        return nil, "payload request failed"
+    end
+
+    if Response:find("unauthorized", 1, true) or Response:find("-- no payload", 1, true) then
+        return nil, "token rejected"
+    end
+
+    return Response
+end
+
+local function resolvePayload()
+    if keyMode() then
+        -- nothing on disk is trusted in key mode: the build comes from the
+        -- server or it does not run at all
+        local Remote, Why = fetchPayload()
+
+        if Remote then
+            return Remote, "licensed"
+        end
+
+        return nil, Why or "none"
+    end
+
+    if CONFIG.PAYLOAD_URL ~= "" then
+        local Ok, Data = pcall(function()
+            return game:HttpGet(CONFIG.PAYLOAD_URL)
+        end)
+
+        if Ok and type(Data) == "string" and #Data > 0 then
+            return Data, "url"
+        end
+    end
+
+    local Embedded = GENV().REINHOOK_EMBEDDED
+    if type(Embedded) == "string" and #Embedded > 0 then
+        return Embedded, "embedded"
+    end
+
+    local FromFile = readIfFile(CONFIG.PAYLOAD_FILE)
+    if FromFile then
+        return FromFile, "file"
+    end
+
+    local Cached = readIfFile(CONFIG.CACHE_FILE)
+    if Cached then
+        return Cached, "cache"
+    end
+
+    for _, Path in ipairs(CONFIG.LEGACY_FILES or {}) do
+        local Legacy = readIfFile(Path)
+
+        if Legacy then
+            return Legacy, "cache"
+        end
+    end
+
+    return nil, "none"
+end
+
+local function getQueueFunction()
+    local G = GENV()
+
+    if type(G.queue_on_teleport) == "function" then
+        return G.queue_on_teleport
+    end
+
+    for _, Name in ipairs({ "syn", "fluxus", "delta", "Solara" }) do
+        local Exec = G[Name]
+        if type(Exec) == "table" and type(Exec.queue_on_teleport) == "function" then
+            return Exec.queue_on_teleport
+        end
+    end
+
+    return nil
+end
+
+local function isInGame()
+    local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+    if not ReplicatedStorage:FindFirstChild("Modules") then
+        return false
+    end
+
+    return workspace:FindFirstChild("Bases") ~= nil
+        or workspace:FindFirstChild("Nodes") ~= nil
+        or workspace:FindFirstChild("Military") ~= nil
+end
+
+-------------------------------------------------------------------- running
+
+local function runPayload(Source)
+    local Chunk, CompileError = loadstring(Source)
+
+    if not Chunk then
+        return false, tostring(CompileError)
+    end
+
+    task.spawn(Chunk)
+
+    return true
+end
+
+local function armForTeleport(Source)
+    local OnDisk = cachePayload(Source)
+
+    local Stub
+    if OnDisk then
+        Stub = string.format('loadstring(readfile([[%s]]))()', CONFIG.CACHE_FILE)
+    else
+        Stub = "loadstring(" .. string.format("%q", Source) .. ")()"
+    end
+
+    local Queue = getQueueFunction()
+    local Queued = false
+
+    if Queue then
+        Queued = pcall(Queue, Stub)
+    end
+
+    return Queued, OnDisk
+end
+
+------------------------------------------------------------------------ gui
+
+local Busy = false
+
+local function BuildGui()
+    local Parent = (type(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+
+    for _, Child in ipairs(Parent:GetChildren()) do
+        if Child.Name == "ReinHookLoader" then
+            Child:Destroy()
+        end
+    end
+
+    local Root = Instance.new("ScreenGui")
+    Root.Name = "ReinHookLoader"
+    Root.IgnoreGuiInset = true
+    Root.ResetOnSpawn = false
+    Root.DisplayOrder = 20
+    Root.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    Root.Parent = Parent
+
+    local Panel = Instance.new("CanvasGroup")
+    Panel.Name = "Panel"
+    Panel.Size = UDim2.fromOffset(WIDTH, HEIGHT)
+    Panel.Position = UDim2.fromScale(0.5, 0.5)
+    Panel.AnchorPoint = Vector2.new(0.5, 0.5)
+    Panel.BackgroundColor3 = PANEL
+    Panel.BorderSizePixel = 0
+    Panel.GroupTransparency = 1
+    Panel.Active = true
+    Panel.Parent = Root
+
+    local PanelCorner = Instance.new("UICorner")
+    PanelCorner.CornerRadius = UDim.new(0, 9)
+    PanelCorner.Parent = Panel
+
+    local PanelStroke = Instance.new("UIStroke")
+    PanelStroke.Color = LINE
+    PanelStroke.Thickness = 1
+    PanelStroke.Transparency = 0.15
+    PanelStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    PanelStroke.Parent = Panel
+
+    -- branding -------------------------------------------------------------
+    local Title = Instance.new("TextLabel")
+    Title.Text = CONFIG.TITLE
+    Title.Font = Enum.Font.GothamBold
+    Title.TextSize = 17
+    Title.TextColor3 = TEXT
+    Title.TextXAlignment = Enum.TextXAlignment.Left
+    Title.BackgroundTransparency = 1
+    Title.Position = UDim2.fromOffset(18, 14)
+    Title.Size = UDim2.new(0, 190, 0, 24)
+    Title.Parent = Panel
+
+    local Tag = Instance.new("TextLabel")
+    Tag.Text = CONFIG.TAG
+    Tag.Font = Enum.Font.GothamMedium
+    Tag.TextSize = 12
+    Tag.TextColor3 = SLATE
+    Tag.TextXAlignment = Enum.TextXAlignment.Left
+    Tag.BackgroundTransparency = 1
+    Tag.Position = UDim2.fromOffset(18 + 86, 19)
+    Tag.Size = UDim2.new(0, 40, 0, 16)
+    Tag.Parent = Panel
+
+    local function placeTag()
+        Tag.Position = UDim2.fromOffset(18 + Title.TextBounds.X + 8, 19)
+    end
+
+    task.defer(placeTag)
+    Title:GetPropertyChangedSignal("TextBounds"):Connect(placeTag)
+
+    local Close = Instance.new("TextButton")
+    Close.Text = "x"
+    Close.Font = Enum.Font.GothamBold
+    Close.TextSize = 14
+    Close.TextColor3 = MUTED
+    Close.BackgroundTransparency = 1
+    Close.Position = UDim2.new(1, -36, 0, 14)
+    Close.Size = UDim2.fromOffset(20, 20)
+    Close.Parent = Panel
+
+    Close.MouseEnter:Connect(function()
+        tween(Close, 0.12, { TextColor3 = TEXT })
+    end)
+
+    Close.MouseLeave:Connect(function()
+        tween(Close, 0.16, { TextColor3 = MUTED })
+    end)
+
+    Close.MouseButton1Click:Connect(function()
+        tween(Panel, 0.15, { GroupTransparency = 1 })
+        task.wait(0.16)
+        Root:Destroy()
+    end)
+
+    local Divider = Instance.new("Frame")
+    Divider.Position = UDim2.fromOffset(18, 50)
+    Divider.Size = UDim2.new(1, -36, 0, 1)
+    Divider.BackgroundColor3 = LINE
+    Divider.BackgroundTransparency = 0.3
+    Divider.BorderSizePixel = 0
+    Divider.Parent = Panel
+
+    -- status ---------------------------------------------------------------
+    StatusDot = Instance.new("Frame")
+    StatusDot.Size = UDim2.fromOffset(7, 7)
+    StatusDot.BackgroundColor3 = STATUS.idle
+    StatusDot.BorderSizePixel = 0
+    StatusDot.Position = UDim2.fromOffset(19, 66)
+    StatusDot.Parent = Panel
+
+    local DotCorner = Instance.new("UICorner")
+    DotCorner.CornerRadius = UDim.new(1, 0)
+    DotCorner.Parent = StatusDot
+
+    StatusLabel = Instance.new("TextLabel")
+    StatusLabel.Text = CONFIG.HINT
+    StatusLabel.Font = Enum.Font.GothamMedium
+    StatusLabel.TextSize = 14
+    StatusLabel.TextColor3 = MUTED
+    StatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+    StatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    StatusLabel.BackgroundTransparency = 1
+    StatusLabel.Position = UDim2.fromOffset(32, 57)
+    StatusLabel.Size = UDim2.new(1, -52, 0, 22)
+    StatusLabel.Parent = Panel
+
+    -- progress -------------------------------------------------------------
+    local Track = Instance.new("Frame")
+    Track.Position = UDim2.fromOffset(18, 88)
+    Track.Size = UDim2.new(1, -36, 0, 4)
+    Track.BackgroundColor3 = DARK
+    Track.BorderSizePixel = 0
+    Track.ClipsDescendants = true
+    Track.Parent = Panel
+
+    local TrackCorner = Instance.new("UICorner")
+    TrackCorner.CornerRadius = UDim.new(1, 0)
+    TrackCorner.Parent = Track
+
+    ProgressFill = Instance.new("Frame")
+    ProgressFill.Size = UDim2.new(0, 0, 1, 0)
+    ProgressFill.BackgroundColor3 = WHITE
+    ProgressFill.BorderSizePixel = 0
+    ProgressFill.Parent = Track
+
+    local FillCorner = Instance.new("UICorner")
+    FillCorner.CornerRadius = UDim.new(1, 0)
+    FillCorner.Parent = ProgressFill
+
+    Caption = Instance.new("TextLabel")
+    Caption.Text = "loads the build and queues it for the next server"
+    Caption.Font = Enum.Font.GothamMedium
+    Caption.TextSize = 12
+    Caption.TextColor3 = MUTED
+    Caption.TextXAlignment = Enum.TextXAlignment.Left
+    Caption.TextWrapped = true
+    Caption.TextYAlignment = Enum.TextYAlignment.Top
+    Caption.BackgroundTransparency = 1
+    Caption.Position = UDim2.fromOffset(18, 100)
+    Caption.Size = UDim2.new(1, -36, 0, 34)
+    Caption.Parent = Panel
+
+    -- key field: only in licensed builds. It takes the caption's place so the
+    -- card keeps its size.
+    local KeyBox = Instance.new("TextBox")
+    KeyBox.Text = storedKey() or ""
+    KeyBox.PlaceholderText = "paste your key"
+    KeyBox.Font = Enum.Font.GothamMedium
+    KeyBox.TextSize = 12
+    KeyBox.TextColor3 = TEXT
+    KeyBox.PlaceholderColor3 = MUTED
+    KeyBox.BackgroundColor3 = DARK
+    KeyBox.BorderSizePixel = 0
+    KeyBox.TextXAlignment = Enum.TextXAlignment.Left
+    KeyBox.ClearTextOnFocus = false
+    KeyBox.Position = UDim2.fromOffset(18, 100)
+    KeyBox.Size = UDim2.new(1, -36, 0, 34)
+    KeyBox.Visible = keyMode()
+
+    local KeyPadding = Instance.new("UIPadding")
+    KeyPadding.PaddingLeft = UDim.new(0, 10)
+    KeyPadding.PaddingRight = UDim.new(0, 10)
+    KeyPadding.Parent = KeyBox
+
+    local KeyCorner = Instance.new("UICorner")
+    KeyCorner.CornerRadius = UDim.new(0, 6)
+    KeyCorner.Parent = KeyBox
+
+    local KeyStroke = Instance.new("UIStroke")
+    KeyStroke.Color = LINE
+    KeyStroke.Transparency = 0.2
+    KeyStroke.Parent = KeyBox
+
+    KeyBox.Parent = Panel
+
+    if keyMode() then
+        Caption.Visible = false
+    end
+
+    -- action ---------------------------------------------------------------
+    Button = Instance.new("TextButton")
+    Button.Name = "Load"
+    Button.Text = ""
+    Button.BackgroundColor3 = WHITE
+    Button.BorderSizePixel = 0
+    Button.AutoButtonColor = false
+    Button.Position = UDim2.fromOffset(18, 140)
+    Button.Size = UDim2.new(1, -36, 0, 42)
+    Button.Parent = Panel
+
+    local ButtonCorner = Instance.new("UICorner")
+    ButtonCorner.CornerRadius = UDim.new(0, 7)
+    ButtonCorner.Parent = Button
+
+    ButtonLabel = Instance.new("TextLabel")
+    ButtonLabel.Text = "load"
+    ButtonLabel.Font = Enum.Font.GothamBold
+    ButtonLabel.TextSize = 15
+    ButtonLabel.TextColor3 = Color3.fromRGB(16, 16, 18)
+    ButtonLabel.TextXAlignment = Enum.TextXAlignment.Center
+    ButtonLabel.BackgroundTransparency = 1
+    ButtonLabel.Size = UDim2.fromScale(1, 1)
+    ButtonLabel.Parent = Button
+
+    Button.MouseEnter:Connect(function()
+        if Busy then
+            return
+        end
+
+        tween(Button, 0.12, { BackgroundColor3 = Color3.fromRGB(245, 245, 247) })
+    end)
+
+    Button.MouseLeave:Connect(function()
+        tween(Button, 0.16, { BackgroundColor3 = WHITE })
+    end)
+
+    local Footer = Instance.new("TextLabel")
+    Footer.Text = "rshift hides the menu"
+    Footer.Font = Enum.Font.GothamMedium
+    Footer.TextSize = 11
+    Footer.TextColor3 = MUTED
+    Footer.TextXAlignment = Enum.TextXAlignment.Left
+    Footer.BackgroundTransparency = 1
+    Footer.Position = UDim2.fromOffset(18, HEIGHT - 30)
+    Footer.Size = UDim2.new(1, -140, 0, 18)
+    Footer.Parent = Panel
+
+    local FooterMark = Instance.new("TextLabel")
+    FooterMark.Text = CONFIG.TITLE .. " " .. CONFIG.TAG
+    FooterMark.Font = Enum.Font.GothamMedium
+    FooterMark.TextSize = 11
+    FooterMark.TextColor3 = SLATE
+    FooterMark.TextXAlignment = Enum.TextXAlignment.Right
+    FooterMark.BackgroundTransparency = 1
+    FooterMark.Position = UDim2.new(1, -130, 1, -30)
+    FooterMark.Size = UDim2.fromOffset(112, 18)
+    FooterMark.Parent = Panel
+
+    ------------------------------------------------------------------ actions
+
+    local function setProgress(Value, Instant)
+        local Target = UDim2.new(math.clamp(Value, 0, 1), 0, 1, 0)
+
+        if Instant then
+            ProgressFill.Size = Target
+        else
+            tween(ProgressFill, 0.3, { Size = Target })
+        end
+    end
+
+    local function setCaption(Text)
+        Caption.Text = Text
+    end
+
+    -- DisplayName when the game gives one, otherwise the account name
+    local function playerName()
+        local Ok, Name = pcall(function()
+            local Player = game:GetService("Players").LocalPlayer
+
+            if not Player then
+                return nil
+            end
+
+            local Display = Player.DisplayName
+
+            if type(Display) == "string" and #Display > 0 then
+                return Display
+            end
+
+            return Player.Name
+        end)
+
+        if Ok and type(Name) == "string" and #Name > 0 then
+            return Name
+        end
+
+        return "friend"
+    end
+
+    local function succeed()
+        setProgress(1, false)
+        tween(ProgressFill, 0.25, { BackgroundColor3 = GOOD })
+        tween(Button, 0.25, { BackgroundColor3 = Color3.fromRGB(127, 214, 168) })
+        tween(ButtonLabel, 0.25, { TextColor3 = Color3.fromRGB(12, 34, 24) })
+
+        ButtonLabel.Text = "queued"
+
+        if keyMode() then
+            SetStatus("good", string.format("welcome %s, enjoy your wipe :)", playerName()))
+            setCaption("the build is running - right shift hides the menu")
+        else
+            SetStatus("good", "successfully loaded")
+            setCaption("reinhook has loaded successfully! Queue into a server and enjoy :)")
+        end
+
+        Busy = false
+    end
+
+    -- In key mode the caption line is hidden (the key box takes its place), so the
+    -- detail has to go into the status line or the user only sees "key rejected"
+    -- with no reason.
+    local function fail(Text, CaptionText)
+        local Detail = CaptionText or Text
+
+        if keyMode() and Detail ~= "" and Detail ~= Text then
+            SetStatus("bad", Text .. " · " .. Detail)
+        else
+            SetStatus("bad", Text)
+            setCaption(Detail)
+        end
+
+        ButtonLabel.Text = "try again"
+        Busy = false
+    end
+
+    -- The actual load, callable directly. It must NOT go through the click signal:
+    -- an RBXScriptSignal has no :Fire(), so re-entering the handler that way threw
+    -- right after "key accepted" and the card sat on "loading" forever.
+    local function doLoad()
+        if Busy then
+            return
+        end
+
+        Busy = true
+        setProgress(0.08, true)
+        SetStatus("work", "resolving payload")
+        setCaption("reading the build out of the loader")
+        ButtonLabel.Text = "loading"
+
+        task.spawn(function()
+            local Source, Origin = resolvePayload()
+
+            if not Source then
+                if keyMode() then
+                    fail("not licensed", tostring(Origin))
+                else
+                    fail("no payload found", "nothing embedded and no cache on disk - set PAYLOAD_URL")
+                end
+
+                return
+            end
+
+            local Size = math.floor(#Source / 1024)
+            setProgress(0.35)
+            SetStatus("work", string.format("%s  ·  %d kb", Origin, Size))
+
+            -- A licensed build is never cached to disk: writing it there would let
+            -- an expired key keep running from the copy. Key mode runs in-game only.
+            local Queued, OnDisk = false, false
+
+            if not keyMode() then
+                Queued, OnDisk = armForTeleport(Source)
+            end
+
+            -- Key mode: authenticate here (lobby), then queue a stub that fetches
+            -- and runs the build after the teleport. Nothing is written to disk,
+            -- and the execute happens in the server instead of the lobby.
+            if keyMode() then
+                local Queue = getQueueFunction()
+                local Url = CONFIG.API .. "/payload?token=" .. tostring(Session) .. "&hwid=" .. hwid()
+
+                if Queue then
+                    local Stub = string.format(
+                        'getgenv().__reinSession={Token=%q,Hwid=%q,API=%q,Key=%q}; loadstring(game:HttpGet(%q))()',
+                        tostring(Session),
+                        hwid(),
+                        CONFIG.API,
+                        tostring(ActiveKey or ""),
+                        Url
+                    )
+
+                    local Queued = pcall(Queue, Stub)
+
+                    if Queued then
+                        setProgress(0.7)
+                        SetStatus("work", "queued for the server")
+                        task.wait(0.25)
+                        succeed()
+                        return
+                    end
+                end
+
+                fail("no queue support", "this executor cannot queue - join a server and run it there")
+                return
+            end
+
+            if isInGame() then
+                setProgress(0.72)
+                SetStatus("work", "starting the build")
+
+                -- hand the session to the payload so its heartbeat can re-check
+                if keyMode() and Session then
+                    GENV().__reinSession = {
+                        Token = Session,
+                        Hwid = hwid(),
+                        API = CONFIG.API,
+                        Key = ActiveKey or "",
+                    }
+                end
+
+                local Ok, Err = runPayload(Source)
+
+                if not Ok then
+                    fail("compile error", tostring(Err):sub(1, 80))
+                    return
+                end
+
+                succeed()
+                return
+            end
+
+            if Queued then
+                setProgress(0.7)
+                SetStatus("work", "queued for the teleport")
+                task.wait(0.25)
+                succeed()
+                return
+            end
+
+            if OnDisk then
+                fail("no queue support", "cached, but this executor cannot queue the build")
+            elseif keyMode() then
+                fail("run this in game", "licensed builds are not cached - execute it in a server")
+            else
+                fail("no file access", "this executor cannot write the cache or queue the build")
+            end
+        end)
+    end
+
+    Button.MouseButton1Click:Connect(function()
+        if Busy then
+            return
+        end
+
+        if not apiTrusted() then
+            fail('insecure api', 'CONFIG.API must be an https url')
+            return
+        end
+
+        if not keyMode() or Session then
+            doLoad()
+            return
+        end
+
+        local Key = KeyBox.Text:gsub("%s+", "")
+
+        if #Key < 4 then
+            fail("key required", "paste your key, then press load")
+            return
+        end
+
+        Busy = true
+        setProgress(0.08, true)
+        SetStatus("work", "checking key")
+
+        task.spawn(function()
+            preloadPing()
+
+            local Token, Why = activate(Key)
+
+            if not Token then
+                if outOfAttempts() then
+                    fail("too many attempts", "kicked - open a ticket")
+                    return
+                end
+
+                fail("key rejected", tostring(Why))
+                return
+            end
+
+            Session = Token
+            ActiveKey = Key
+
+            if type(writefile) == "function" then
+                pcall(writefile, CONFIG.KEY_CACHE, Key)
+            end
+
+            setProgress(0.2)
+            SetStatus("work", "key accepted")
+            Busy = false
+
+            doLoad()
+        end)
+    end)
+
+    -- drag ------------------------------------------------------------------
+    local Dragging, DragStart, StartPos
+
+    Panel.InputBegan:Connect(function(Input)
+        if Input.UserInputType == Enum.UserInputType.MouseButton1
+            or Input.UserInputType == Enum.UserInputType.Touch then
+            Dragging = true
+            DragStart = Input.Position
+            StartPos = Panel.Position
+        end
+    end)
+
+    Panel.InputEnded:Connect(function(Input)
+        if Input.UserInputType == Enum.UserInputType.MouseButton1
+            or Input.UserInputType == Enum.UserInputType.Touch then
+            Dragging = false
+        end
+    end)
+
+    UserInputService.InputChanged:Connect(function(Input)
+        if not Dragging then
+            return
+        end
+
+        local Delta = Input.Position - DragStart
+        Panel.Position = UDim2.new(
+            StartPos.X.Scale, StartPos.X.Offset + Delta.X,
+            StartPos.Y.Scale, StartPos.Y.Offset + Delta.Y
+        )
+    end)
+
+    -- entrance --------------------------------------------------------------
+    Panel.Size = UDim2.fromOffset(WIDTH - 12, HEIGHT - 8)
+    tween(Panel, 0.22, { GroupTransparency = 0 })
+    tween(Panel, 0.24, { Size = UDim2.fromOffset(WIDTH, HEIGHT) })
+
+    return Root
+end
+
+------------------------------------------------------------------- bootstrap
+
+local function Bootstrap()
+    if isInGame() then
+        local Source = resolvePayload()
+
+        if not Source then
+            warn("[reinhook] payload missing")
+            return
+        end
+
+        cachePayload(Source)
+
+        local Ok, Err = runPayload(Source)
+        if not Ok then
+            warn("[reinhook] " .. tostring(Err))
+        end
+
+        return
+    end
+
+    local Ok, Err = pcall(BuildGui)
+    if not Ok then
+        warn("[reinhook] loader gui failed: " .. tostring(Err))
+    end
+end
+
+-- Deferred: the build is inlined at the bottom of this file as a global string,
+-- which is assigned after this line has already executed.
+if type(task) == "table" and type(task.defer) == "function" then
+    task.defer(Bootstrap)
+else
+    spawn(function()
+        wait()
+        Bootstrap()
+    end)
+end
