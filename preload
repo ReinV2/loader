@@ -1,9 +1,27 @@
 --[[
 -- reinhook v1 - loader
     ===========================================================================
-   ]]
+    Execute anywhere.
+
+      lobby    ->  small window, one load button
+      in match ->  no window, the build runs immediately
+
+    load caches the build to disk and queues a tiny stub with queue_on_teleport,
+    so the teleport into the match re-executes it. The build re-queues itself
+    afterwards, which keeps every later teleport covered.
+
+    Payload resolution order:
+        1. CONFIG.PAYLOAD_URL
+        2. embedded source (built in below)
+        3. CONFIG.PAYLOAD_FILE
+        4. CONFIG.CACHE_FILE / legacy cache paths
+]]
 
 local CONFIG = {
+    -- Key system. Leave API empty for an embedded build (the payload ships inside
+    -- the loader). Set it to your Worker URL and the loader authenticates first
+    -- and then fetches the build from the server, so a leaked loader contains no
+    -- payload at all.
     API = "https://reinauth.natxoxoheart.workers.dev",
     KEY_CACHE = "reinhook/key.txt",
     PAYLOAD_URL = "",
@@ -164,6 +182,46 @@ local function storedKey()
     return nil
 end
 
+-- GET helper. Cloudflare answers plain game:HttpGet with a challenge often
+-- enough that the loader used to report "payload request failed" for what was
+-- really a bot check, so the request() family is tried first with a real
+-- user agent and HttpGet is only the fallback.
+local function get(Url)
+    local G = GENV()
+    local Headers = { ["User-Agent"] = "reinhook/1.0" }
+    local Candidates = { rawget(G, "request"), rawget(G, "http_request"), rawget(G, "http_get") }
+    local Syn = rawget(G, "syn")
+
+    if type(Syn) == "table" and type(Syn.request) == "function" then
+        table.insert(Candidates, Syn.request)
+    end
+
+    for _, Fn in ipairs(Candidates) do
+        if type(Fn) == "function" then
+            local Ok, Result = pcall(Fn, {
+                Url = Url,
+                Method = "GET",
+                Headers = Headers,
+            })
+
+            if Ok and type(Result) == "table" and type(Result.Body) == "string"
+                and #Result.Body >= 64 then
+                return Result.Body
+            end
+        end
+    end
+
+    local Ok, Data = pcall(function()
+        return game:HttpGet(Url)
+    end)
+
+    if Ok and type(Data) == "string" then
+        return Data
+    end
+
+    return nil
+end
+
 -- POST helper. game:HttpGet(url, nocache, headers, body) is a Synapse-era
 -- signature that many executors ignore, which silently turns the POST into a GET
 -- and the server answers with its root page. Prefer the modern request() APIs.
@@ -276,13 +334,39 @@ local function fetchPayload()
         return nil, "no session"
     end
 
-    local Ok, Response = pcall(function()
-        return game:HttpGet(
-            CONFIG.API .. "/payload?token=" .. Session .. "&hwid=" .. hwid()
-        )
-    end)
+    local Response = get(
+        CONFIG.API .. "/payload?token=" .. tostring(Session) .. "&hwid=" .. hwid()
+    )
 
-    if not Ok or type(Response) ~= "string" or #Response < 64 then
+    if type(Response) == "string" and Response:find("unauthorized", 1, true) then
+        -- one silent re-auth: activating again clears the replay counter for this
+        -- bucket, which is what makes a retry succeed instead of failing forever
+        if ActiveKey then
+            local Token = activate(ActiveKey)
+
+            if Token then
+                Session = Token
+
+                Response = get(
+                    CONFIG.API .. "/payload?token=" .. tostring(Session) .. "&hwid=" .. hwid()
+                )
+            end
+        end
+    end
+
+    if type(Response) ~= "string" then
+        return nil, "payload request failed"
+    end
+
+    if Response:find("<!DOCTYPE", 1, true) or Response:find("<html", 1, true) then
+        return nil, "server blocked the request"
+    end
+
+    if Response:find("unauthorized", 1, true) then
+        return nil, "token rejected - retry"
+    end
+
+    if #Response < 64 then
         return nil, "payload request failed"
     end
 
